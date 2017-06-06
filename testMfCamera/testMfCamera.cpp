@@ -48,7 +48,279 @@ HRESULT LogMediaType(IMFMediaType *pType);
 HRESULT EnumerateCaptureFormats(IMFMediaSource *pSource);
 
 
+class MFCamera {
+public:
+	MFCamera() {}
+	virtual ~MFCamera() {}
+
+
+public:
+	bool init()
+	{
+		IMFAttributes *pConfig = NULL;
+		IMFActivate **ppDevices = NULL;
+		IUnknown *spTransformUnk = NULL;
+		UINT32 count = 0;
+		DWORD mftStatus = 0;
+
+		// Create an attribute store to hold the search criteria.
+		CHECK_HR(MFCreateAttributes(&pConfig, 1), "MFCreateAttributes error\n");
+
+		// Request video capture devices.
+		CHECK_HR(pConfig->SetGUID(
+			MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
+			MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID
+		), "pConfig->SetGUID error");
+
+		// Enumerate the devices
+		CHECK_HR(MFEnumDeviceSources(pConfig, &ppDevices, &count), "MFEnumDeviceSources error\n");
+
+		// Create a media source for the first device in the list.
+		CHECK_HR(ppDevices[WEBCAM_DEVICE_INDEX]->ActivateObject(IID_PPV_ARGS(&m_pSource)), "ppDevices[0]->ActivateObject error\n");
+
+		// Create a source reader.
+		CHECK_HR(MFCreateSourceReaderFromMediaSource(
+			m_pSource,
+			pConfig,
+			&m_pSourceReader), "MFCreateSourceReaderFromMediaSource error \n");
+
+		//EnumerateCaptureFormats(pSource);
+
+		MFCreateMediaType(&m_pSrcOutMediaType);
+		m_pSrcOutMediaType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+		m_pSrcOutMediaType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB24);
+		MFSetAttributeSize(m_pSrcOutMediaType, MF_MT_FRAME_SIZE, CAMERA_RESOLUTION_WIDTH, CAMERA_RESOLUTION_HEIGHT);
+		CHECK_HR(MFSetAttributeRatio(m_pSrcOutMediaType, MF_MT_FRAME_RATE, TARGET_FRAME_RATE, 1), "Failed to set frame rate on video device out type.\n");
+
+		CHECK_HR(m_pSourceReader->SetCurrentMediaType(0, NULL, m_pSrcOutMediaType), "Failed to set media type on source reader.\n");
+
+
+		CHECK_HR(CoCreateInstance(CLSID_CMSH264EncoderMFT, NULL, CLSCTX_INPROC_SERVER,
+			IID_IUnknown, (void**)&spTransformUnk), "Failed to create H264 encoder MFT.\n");
+
+		CHECK_HR(spTransformUnk->QueryInterface(IID_PPV_ARGS(&m_pTransform)), "Failed to get IMFTransform interface from H264 encoder MFT object.\n");
+
+
+		MFCreateMediaType(&m_pMFTOutputMediaType);
+		m_pMFTOutputMediaType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+		m_pMFTOutputMediaType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+		CHECK_HR(m_pMFTOutputMediaType->SetUINT32(MF_MT_AVG_BITRATE, TARGET_AVERAGE_BIT_RATE), "Failed to set average bit rate on H264 output media type.\n");
+		CHECK_HR(MFSetAttributeSize(m_pMFTOutputMediaType, MF_MT_FRAME_SIZE, CAMERA_RESOLUTION_WIDTH, CAMERA_RESOLUTION_HEIGHT), "Failed to set frame size on H264 MFT out type.\n");
+		CHECK_HR(MFSetAttributeRatio(m_pMFTOutputMediaType, MF_MT_FRAME_RATE, TARGET_FRAME_RATE, 1), "Failed to set frame rate on H264 MFT out type.\n");
+		CHECK_HR(MFSetAttributeRatio(m_pMFTOutputMediaType, MF_MT_PIXEL_ASPECT_RATIO, 1, 1), "Failed to set aspect ratio on H264 MFT out type.\n");
+		m_pMFTOutputMediaType->SetUINT32(MF_MT_INTERLACE_MODE, 2);	// 2 = Progressive scan, i.e. non-interlaced.
+		m_pMFTOutputMediaType->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE);
+
+		CHECK_HR(m_pTransform->SetOutputType(0, m_pMFTOutputMediaType, 0), "Failed to set output media type on H.264 encoder MFT.\n");
+
+		MFCreateMediaType(&m_pMFTInputMediaType);
+		m_pMFTInputMediaType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+		m_pMFTInputMediaType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_YUY2);
+		CHECK_HR(MFSetAttributeSize(m_pMFTInputMediaType, MF_MT_FRAME_SIZE, CAMERA_RESOLUTION_WIDTH, CAMERA_RESOLUTION_HEIGHT), "Failed to set frame size on H264 MFT out type.\n");
+		CHECK_HR(MFSetAttributeRatio(m_pMFTInputMediaType, MF_MT_FRAME_RATE, TARGET_FRAME_RATE, 1), "Failed to set frame rate on H264 MFT out type.\n");
+		CHECK_HR(MFSetAttributeRatio(m_pMFTInputMediaType, MF_MT_PIXEL_ASPECT_RATIO, 1, 1), "Failed to set aspect ratio on H264 MFT out type.\n");
+		m_pMFTInputMediaType->SetUINT32(MF_MT_INTERLACE_MODE, 2);
+
+		CHECK_HR(m_pTransform->SetInputType(0, m_pMFTInputMediaType, 0), "Failed to set input media type on H.264 encoder MFT.\n");
+
+		CHECK_HR(m_pTransform->GetInputStatus(0, &mftStatus), "Failed to get input status from H.264 MFT.\n");
+		if (MFT_INPUT_STATUS_ACCEPT_DATA != mftStatus) {
+			printf("E: ApplyTransform() pTransform->GetInputStatus() not accept data.\n");
+			goto done;
+		}
+
+
+		CHECK_HR(m_pTransform->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, NULL), "Failed to process FLUSH command on H.264 MFT.\n");
+		CHECK_HR(m_pTransform->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, NULL), "Failed to process BEGIN_STREAMING command on H.264 MFT.\n");
+		CHECK_HR(m_pTransform->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, NULL), "Failed to process START_OF_STREAM command on H.264 MFT.\n");
+
+
+		SafeRelease(pConfig);
+		for (DWORD i = 0; i < count; i++)
+		{
+			SafeRelease(&ppDevices[i]);
+		}
+		CoTaskMemFree(ppDevices);
+		SafeRelease(spTransformUnk);
+		m_isInit = true;
+		return true;
+
+	done:
+		SafeRelease(pConfig);
+		for (DWORD i = 0; i < count; i++)
+		{
+			SafeRelease(&ppDevices[i]);
+		}
+		CoTaskMemFree(ppDevices);
+		SafeRelease(spTransformUnk);
+		m_isInit = false;
+		return false;
+	}
+
+	bool readFrame(BYTE** buff, DWORD& len)
+	{
+		
+		IMFSample *videoSample = NULL;
+		MFT_OUTPUT_STREAM_INFO StreamInfo;
+		IMFSample *mftOutSample = NULL;
+		IMFMediaBuffer *pBuffer = NULL;
+		LONGLONG llVideoTimeStamp, llSampleDuration;
+		DWORD streamIndex, flags;
+		MFT_OUTPUT_DATA_BUFFER _outputDataBuffer;
+		HRESULT mftProcessOutput = S_OK;
+		DWORD processOutputStatus = 0;
+		DWORD mftOutFlags;
+		bool frameSent = false;
+
+
+
+		CHECK_HR(m_pSourceReader->ReadSample(
+			MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+			0,                              // Flags.
+			&streamIndex,                   // Receives the actual stream index. 
+			&flags,                         // Receives status flags.
+			&llVideoTimeStamp,              // Receives the time stamp.
+			&videoSample                    // Receives the sample or NULL.
+		), "Error reading video sample.");
+
+		if (videoSample)
+		{
+
+			CHECK_HR(videoSample->SetSampleTime(llVideoTimeStamp), "Error setting the video sample time.\n");
+			CHECK_HR(videoSample->GetSampleDuration(&llSampleDuration), "Error getting video sample duration.\n");
+
+			HRESULT hr = m_pTransform->ProcessInput(0, videoSample, 0);
+			CHECK_HR(hr, "The resampler H264 ProcessInput call failed.\n");
+
+			CHECK_HR(m_pTransform->GetOutputStatus(&mftOutFlags), "H264 MFT GetOutputStatus failed.\n");
+
+			if (mftOutFlags == MFT_OUTPUT_STATUS_SAMPLE_READY)
+			{
+				printf("Sample ready.\n");
+
+				CHECK_HR(m_pTransform->GetOutputStreamInfo(0, &StreamInfo), "Failed to get output stream info from H264 MFT.\n");
+
+				CHECK_HR(MFCreateSample(&mftOutSample), "Failed to create MF sample.\n");
+				CHECK_HR(MFCreateMemoryBuffer(StreamInfo.cbSize, &pBuffer), "Failed to create memory buffer.\n");
+				CHECK_HR(mftOutSample->AddBuffer(pBuffer), "Failed to add sample to buffer.\n");
+
+				while (true)
+				{
+					_outputDataBuffer.dwStreamID = 0;
+					_outputDataBuffer.dwStatus = 0;
+					_outputDataBuffer.pEvents = NULL;
+					_outputDataBuffer.pSample = mftOutSample;
+
+					mftProcessOutput = m_pTransform->ProcessOutput(0, 1, &_outputDataBuffer, &processOutputStatus);
+
+					if (mftProcessOutput != MF_E_TRANSFORM_NEED_MORE_INPUT)
+					{
+						CHECK_HR(_outputDataBuffer.pSample->SetSampleTime(llVideoTimeStamp), "Error setting MFT sample time.\n");
+						CHECK_HR(_outputDataBuffer.pSample->SetSampleDuration(llSampleDuration), "Error setting MFT sample duration.\n");
+
+						IMFMediaBuffer *buf = NULL;
+						DWORD bufLength;
+						CHECK_HR(_outputDataBuffer.pSample->ConvertToContiguousBuffer(&buf), "ConvertToContiguousBuffer failed.\n");
+						CHECK_HR(buf->GetCurrentLength(&bufLength), "Get buffer length failed.\n");
+						printf("Writing sample \n");
+
+
+						//printf("Writing sample %i, spacing %I64dms, sample time %I64d, sample duration %I64d, sample size %i.\n", frameCount, now - _lastSendAt, llVideoTimeStamp, llSampleDuration, bufLength);
+
+						BYTE * rawBuffer = NULL;
+						buf->Lock(&rawBuffer, NULL, NULL);
+						len = bufLength;
+						*buff = new BYTE[len];
+						memmove(*buff, rawBuffer, len);
+						buf->Unlock();
+
+						SafeRelease(&buf);
+
+						frameSent = true;
+					}
+
+					break;
+				}
+			}
+
+
+		}
+
+
+		done:
+
+		SafeRelease(videoSample);
+		SafeRelease(mftOutSample);
+		SafeRelease(pBuffer);
+		return frameSent;
+		
+	}
+
+	void deInit()
+	{
+		SafeRelease(m_pSource);
+		SafeRelease(m_pSourceReader);
+		SafeRelease(m_pSrcOutMediaType);
+		SafeRelease(m_pMFTInputMediaType); 
+		SafeRelease(m_pMFTOutputMediaType);
+		SafeRelease(m_pTransform);
+	}
+
+public:
+	static const int CAMERA_RESOLUTION_WIDTH = 800; // 800; // 1280;
+	static const int CAMERA_RESOLUTION_HEIGHT = 600; // 600; //  1024;
+	static const int TARGET_FRAME_RATE = 30;// 5; 15; 30	// Note that this if the video device does not support this frame rate the video source reader will fail to initialise.
+	static const int TARGET_AVERAGE_BIT_RATE = 345600000; // Adjusting this affects the quality of the H264 bit stream.
+	static const int WEBCAM_DEVICE_INDEX = 0;	// <--- Set to 0 to use default system webcam.
+
+public:
+	IMFMediaSource *m_pSource{ NULL };
+	IMFSourceReader *m_pSourceReader{ NULL };
+	IMFMediaType *m_pSrcOutMediaType{ NULL }, *m_pMFTInputMediaType{ NULL }, *m_pMFTOutputMediaType{ NULL };
+	IMFTransform *m_pTransform{ NULL };
+
+
+private:
+	bool m_isInit{ false };
+};
+
+MFCamera g_camera;
+
 int main()
+{
+	CHECK_HR(CoInitializeEx(0, COINIT_MULTITHREADED), "CoInitializeEx error!\n");
+	CHECK_HR(MFStartup(MF_VERSION), "MFStartup error!\n");
+
+	if (!g_camera.init())
+	{
+		printf("camera init error");
+		goto done;
+	}
+
+	int count = 0;
+
+	while (count < 100)
+	{
+		count++;
+		BYTE* buff = NULL;
+		DWORD len;
+		g_camera.readFrame(&buff, len);
+
+		if (buff)
+		{
+			delete buff;
+			buff = NULL;
+		}
+		
+	}
+
+	g_camera.deInit();
+	return 0;
+done:
+	return 1;
+}
+
+/*int main()
 {
 	static const int CAMERA_RESOLUTION_WIDTH = 800; // 800; // 1280;
 	static const int CAMERA_RESOLUTION_HEIGHT = 600; // 600; //  1024;
@@ -257,7 +529,7 @@ done:
 	CoTaskMemFree(ppDevices);
 
     return 1;
-}
+}*/
 
 
 
